@@ -1,0 +1,1 @@
+Deploy to Vercel with latest Supabase integration
