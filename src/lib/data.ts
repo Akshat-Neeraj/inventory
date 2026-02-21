@@ -1,12 +1,12 @@
-import type { InventoryItem, Sale, SaleItem } from './types';
-
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import path from 'path';
-
 import { getSupabaseAdmin } from './supabase-server';
+import type { InventoryItem, Sale, SaleItem } from './types';
 
+// Check environment once
 const hasSupabase = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
 
+// --- Type Definitions ---
 type DbInventoryRow = {
   id: string;
   name: string;
@@ -22,36 +22,12 @@ type DbInventoryRow = {
 type DbSaleRow = {
   id: string;
   receipt_number: number;
-  items: SaleItem[];
+  items: SaleItem[] | string; // Supabase returns JSONB as string or object depending on config
   total: number;
   profit: number;
   date: string;
   created_at?: string;
 };
-
-function mapInventoryRow(row: DbInventoryRow): InventoryItem {
-  return {
-    id: row.id,
-    name: row.name,
-    category: row.category,
-    price: row.price,
-    costPrice: row.cost_price,
-    stockLevel: row.stock_level,
-    lowStockThreshold: row.low_stock_threshold,
-    lastSoldDate: row.last_sold_date,
-  };
-}
-
-function mapSaleRow(row: DbSaleRow): Sale {
-  return {
-    id: row.id,
-    receiptNumber: row.receipt_number,
-    items: row.items,
-    total: row.total,
-    profit: row.profit,
-    date: row.date,
-  };
-}
 
 type DbState = {
   inventory: InventoryItem[];
@@ -59,12 +35,14 @@ type DbState = {
   nextSaleNumber: number;
 };
 
+// --- Global Cache for Local Dev ---
 declare global {
   var __inventoryProDb: DbState | undefined;
   var __inventoryProDbInit: Promise<void> | undefined;
   var __inventoryProDbWrite: Promise<void> | undefined;
 }
 
+// --- Helpers ---
 function createId() {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
     return crypto.randomUUID();
@@ -72,37 +50,42 @@ function createId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function getDb(): DbState {
-  if (!globalThis.__inventoryProDb) {
-    globalThis.__inventoryProDb = {
-      inventory: [],
-      sales: [],
-      nextSaleNumber: 1,
-    };
-  }
-  return globalThis.__inventoryProDb;
-}
-
-function normalizeDbState(input: unknown): DbState | null {
-  if (!input || typeof input !== 'object') return null;
-  const parsed = input as Partial<DbState>;
-  if (!Array.isArray(parsed.inventory) || !Array.isArray(parsed.sales)) return null;
-
-  const maxReceipt = parsed.sales.reduce((max, s) => {
-    const rn = typeof (s as Sale).receiptNumber === 'number' ? (s as Sale).receiptNumber : 0;
-    return rn > max ? rn : max;
-  }, 0);
-
+function mapInventoryRow(row: DbInventoryRow): InventoryItem {
   return {
-    inventory: parsed.inventory as DbState['inventory'],
-    sales: parsed.sales as DbState['sales'],
-    nextSaleNumber:
-      typeof parsed.nextSaleNumber === 'number' && parsed.nextSaleNumber > 0 ? parsed.nextSaleNumber : maxReceipt + 1,
+    id: row.id,
+    name: row.name,
+    category: row.category,
+    price: Number(row.price),
+    costPrice: Number(row.cost_price),
+    stockLevel: Number(row.stock_level),
+    lowStockThreshold: Number(row.low_stock_threshold),
+    lastSoldDate: row.last_sold_date,
   };
 }
 
+function mapSaleRow(row: DbSaleRow): Sale {
+  // Handle potential stringified JSON from DB
+  const parsedItems = typeof row.items === 'string' ? JSON.parse(row.items) : row.items;
+  return {
+    id: row.id,
+    receiptNumber: row.receipt_number,
+    items: parsedItems,
+    total: Number(row.total),
+    profit: Number(row.profit),
+    date: row.date,
+  };
+}
+
+// --- Local JSON DB Management ---
 function getDbFilePath() {
   return path.join(process.cwd(), 'data', 'inventorypro-db.json');
+}
+
+function getDb(): DbState {
+  if (!globalThis.__inventoryProDb) {
+    globalThis.__inventoryProDb = { inventory: [], sales: [], nextSaleNumber: 1 };
+  }
+  return globalThis.__inventoryProDb;
 }
 
 async function ensureDbLoaded() {
@@ -110,55 +93,46 @@ async function ensureDbLoaded() {
     await globalThis.__inventoryProDbInit;
     return;
   }
-
   globalThis.__inventoryProDbInit = (async () => {
-    const filePath = getDbFilePath();
     try {
-      const raw = await readFile(filePath, 'utf8');
-      const parsed = JSON.parse(raw) as unknown;
-      const normalized = normalizeDbState(parsed);
-      if (normalized) {
-        globalThis.__inventoryProDb = normalized;
+      const raw = await readFile(getDbFilePath(), 'utf8');
+      const parsed = JSON.parse(raw);
+      // Basic normalization logic
+      if (parsed && Array.isArray(parsed.inventory)) {
+        globalThis.__inventoryProDb = parsed;
         return;
       }
-    } catch {
-      // ignore
-    }
-
+    } catch { /* ignore missing file */ }
     const db = getDb();
     await persistDb(db);
   })();
-
   await globalThis.__inventoryProDbInit;
 }
 
 async function persistDb(db: DbState) {
   const filePath = getDbFilePath();
-
   const previous = globalThis.__inventoryProDbWrite ?? Promise.resolve();
   globalThis.__inventoryProDbWrite = previous.then(async () => {
     await mkdir(path.dirname(filePath), { recursive: true });
     await writeFile(filePath, JSON.stringify(db, null, 2), 'utf8');
   });
-
   await globalThis.__inventoryProDbWrite;
 }
+
+// --- CRUD Operations ---
 
 export async function getInventory(): Promise<InventoryItem[]> {
   if (hasSupabase) {
     const supabase = getSupabaseAdmin();
-    if (!supabase) {
-      await ensureDbLoaded();
-      return [...getDb().inventory];
+    if (supabase) {
+      const { data, error } = await supabase
+        .from('inventory_items')
+        .select('*')
+        .order('created_at', { ascending: false });
+      if (error) throw error;
+      return (data as DbInventoryRow[]).map(mapInventoryRow);
     }
-    const { data, error } = await supabase
-      .from('inventory_items')
-      .select('*')
-      .order('created_at', { ascending: false });
-    if (error) throw error;
-    return (data as DbInventoryRow[]).map(mapInventoryRow);
   }
-
   await ensureDbLoaded();
   return [...getDb().inventory];
 }
@@ -166,15 +140,15 @@ export async function getInventory(): Promise<InventoryItem[]> {
 export async function getSales(): Promise<Sale[]> {
   if (hasSupabase) {
     const supabase = getSupabaseAdmin();
-    if (!supabase) {
-      await ensureDbLoaded();
-      return [...getDb().sales];
+    if (supabase) {
+      const { data, error } = await supabase
+        .from('sales')
+        .select('*')
+        .order('date', { ascending: false });
+      if (error) throw error;
+      return (data as DbSaleRow[]).map(mapSaleRow);
     }
-    const { data, error } = await supabase.from('sales').select('*').order('date', { ascending: false });
-    if (error) throw error;
-    return (data as DbSaleRow[]).map(mapSaleRow);
   }
-
   await ensureDbLoaded();
   return [...getDb().sales];
 }
@@ -184,29 +158,23 @@ export async function addInventoryItem(
 ): Promise<InventoryItem> {
   if (hasSupabase) {
     const supabase = getSupabaseAdmin();
-    if (!supabase) {
-      await ensureDbLoaded();
-      const db = getDb();
-      const newItem: InventoryItem = { ...item, id: createId(), lastSoldDate: null };
-      db.inventory.push(newItem);
-      await persistDb(db);
-      return newItem;
+    if (supabase) {
+      const { data, error } = await supabase
+        .from('inventory_items')
+        .insert({
+          name: item.name,
+          category: item.category,
+          price: item.price,
+          cost_price: item.costPrice,
+          stock_level: item.stockLevel,
+          low_stock_threshold: item.lowStockThreshold,
+          last_sold_date: item.lastSoldDate ?? null,
+        })
+        .select('*')
+        .single();
+      if (error) throw error;
+      return mapInventoryRow(data as DbInventoryRow);
     }
-    const { data, error } = await supabase
-      .from('inventory_items')
-      .insert({
-        name: item.name,
-        category: item.category,
-        price: item.price,
-        cost_price: item.costPrice,
-        stock_level: item.stockLevel,
-        low_stock_threshold: item.lowStockThreshold,
-        last_sold_date: item.lastSoldDate ?? null,
-      })
-      .select('*')
-      .single();
-    if (error) throw error;
-    return mapInventoryRow(data as DbInventoryRow);
   }
 
   await ensureDbLoaded();
@@ -232,36 +200,27 @@ export async function updateInventoryItem(
 ): Promise<InventoryItem | null> {
   if (hasSupabase) {
     const supabase = getSupabaseAdmin();
-    if (!supabase) {
-      await ensureDbLoaded();
-      const db = getDb();
-      const idx = db.inventory.findIndex((i) => i.id === id);
-      if (idx === -1) return null;
-      const updated = { ...db.inventory[idx], ...updates };
-      db.inventory = [...db.inventory.slice(0, idx), updated, ...db.inventory.slice(idx + 1)];
-      await persistDb(db);
-      return updated;
+    if (supabase) {
+      const patch: Record<string, any> = {};
+      if (updates.stockLevel !== undefined) patch.stock_level = updates.stockLevel;
+      if (updates.lowStockThreshold !== undefined) patch.low_stock_threshold = updates.lowStockThreshold;
+      if (updates.lastSoldDate !== undefined) patch.last_sold_date = updates.lastSoldDate;
+      if (updates.price !== undefined) patch.price = updates.price;
+      if (updates.costPrice !== undefined) patch.cost_price = updates.costPrice;
+      if (updates.name !== undefined) patch.name = updates.name;
+      if (updates.category !== undefined) patch.category = updates.category;
+
+      const { data, error } = await supabase
+        .from('inventory_items')
+        .update(patch)
+        .eq('id', id)
+        .select('*')
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data) return null;
+      return mapInventoryRow(data as DbInventoryRow);
     }
-    const patch: Record<string, unknown> = {};
-
-    if (typeof updates.stockLevel === 'number') patch.stock_level = updates.stockLevel;
-    if (typeof updates.lowStockThreshold === 'number') patch.low_stock_threshold = updates.lowStockThreshold;
-    if (typeof updates.lastSoldDate === 'string' || updates.lastSoldDate === null) patch.last_sold_date = updates.lastSoldDate;
-    if (typeof updates.price === 'number') patch.price = updates.price;
-    if (typeof updates.costPrice === 'number') patch.cost_price = updates.costPrice;
-    if (typeof updates.name === 'string') patch.name = updates.name;
-    if (typeof updates.category === 'string') patch.category = updates.category;
-
-    const { data, error } = await supabase
-      .from('inventory_items')
-      .update(patch)
-      .eq('id', id)
-      .select('*')
-      .maybeSingle();
-
-    if (error) throw error;
-    if (!data) return null;
-    return mapInventoryRow(data as DbInventoryRow);
   }
 
   await ensureDbLoaded();
@@ -269,154 +228,125 @@ export async function updateInventoryItem(
   const idx = db.inventory.findIndex((i) => i.id === id);
   if (idx === -1) return null;
   const updated = { ...db.inventory[idx], ...updates };
-  db.inventory = [...db.inventory.slice(0, idx), updated, ...db.inventory.slice(idx + 1)];
+  db.inventory[idx] = updated;
   await persistDb(db);
   return updated;
 }
 
-// ---------------- FIXED DELETE FUNCTION ----------------
+// ---------------- UPDATED & FIXED DELETE FUNCTION ----------------
 export async function deleteInventoryItem(id: string): Promise<boolean> {
   if (hasSupabase) {
     const supabase = getSupabaseAdmin();
-    if (!supabase) {
-      await ensureDbLoaded();
-      const db = getDb();
-      db.inventory = db.inventory.filter((i) => i.id !== id);
-      db.sales = db.sales.filter((sale) => !sale.items.some((item) => item.itemId === id));
-      await persistDb(db);
-      return true;
-    }
-
-    try {
-      // 1️⃣ Get all sales
-      const { data: sales, error } = await supabase
-        .from('sales')
-        .select('id, items');
-
-      if (error) throw error;
-
-      // 2️⃣ Find sales containing this product
-      const salesToDelete: string[] = [];
-
-      for (const sale of sales || []) {
-        const items =
-          typeof sale.items === 'string'
-            ? JSON.parse(sale.items)
-            : sale.items || [];
-
-        const containsProduct = items.some(
-          (item: any) => item.itemId === id
-        );
-
-        if (containsProduct) {
-          salesToDelete.push(sale.id);
-        }
-      }
-
-      // 3️⃣ Delete those sales
-      if (salesToDelete.length > 0) {
-        await supabase
+    if (supabase) {
+      try {
+        // 1. Fetch sales that might contain this item
+        // Note: For very large DBs, this requires a JSONB index or a different structure.
+        // For standard shop inventory, this is acceptable.
+        const { data: sales, error: fetchError } = await supabase
           .from('sales')
+          .select('id, items');
+
+        if (fetchError) throw fetchError;
+
+        if (sales && sales.length > 0) {
+          const salesToDelete = sales
+            .filter((sale) => {
+              const items = typeof sale.items === 'string' ? JSON.parse(sale.items) : sale.items;
+              return Array.isArray(items) && items.some((i: any) => i.itemId === id);
+            })
+            .map((s) => s.id);
+
+          // 2. Delete related sales first (Cleanup)
+          if (salesToDelete.length > 0) {
+            const { error: deleteSalesError } = await supabase
+              .from('sales')
+              .delete()
+              .in('id', salesToDelete);
+            if (deleteSalesError) throw deleteSalesError;
+          }
+        }
+
+        // 3. Delete the inventory item
+        const { error: deleteItemError } = await supabase
+          .from('inventory_items')
           .delete()
-          .in('id', salesToDelete);
+          .eq('id', id);
+
+        if (deleteItemError) throw deleteItemError;
+
+        return true;
+      } catch (err) {
+        console.error('Delete operation failed:', err);
+        return false;
       }
-
-      // 4️⃣ Delete the product itself
-      await supabase
-        .from('inventory_items')
-        .delete()
-        .eq('id', id);
-
-      return true;
-    } catch (err) {
-      console.error(err);
-      return false;
     }
   }
 
-  // ---------------- Local JSON DB ----------------
+  // Local Fallback
   await ensureDbLoaded();
   const db = getDb();
-
-  // Remove inventory item
+  const initialSalesCount = db.sales.length;
+  
+  // Filter out sales containing the item
+  db.sales = db.sales.filter((sale) => !sale.items.some((item) => item.itemId === id));
+  
+  // Filter out the item
+  const initialInventoryCount = db.inventory.length;
   db.inventory = db.inventory.filter((i) => i.id !== id);
 
-  // Remove sales that contain this item
-  db.sales = db.sales.filter((sale) => !sale.items.some((item) => item.itemId === id));
+  if (db.inventory.length === initialInventoryCount) return false; // Item didn't exist
 
   await persistDb(db);
   return true;
 }
-// ---------------------------------------------------------
 
 export async function processSale(
   cart: SaleItem[],
 ): Promise<{ sale: Sale; updatedInventory: InventoryItem[] } | { error: string }> {
   if (hasSupabase) {
     const supabase = getSupabaseAdmin();
-    if (!supabase) {
-      await ensureDbLoaded();
-      const db = getDb();
-      const inventoryById = new Map(db.inventory.map((i) => [i.id, i] as const));
+    if (supabase) {
+      // Use RPC for atomic transaction if available, otherwise fallback logic could be here
+      // Assuming RPC 'process_sale' exists and handles stock deduction
+      const { data, error } = await supabase.rpc('process_sale', { cart });
       
-      const sale: Sale = {
-        id: createId(),
-        receiptNumber: db.nextSaleNumber,
-        date: new Date().toISOString(),
-        items: cart,
-        total: cart.reduce((sum, item) => sum + item.price * item.quantity, 0),
-        profit: cart.reduce((sum, item) => {
-          const inventoryItem = inventoryById.get(item.itemId);
-          if (!inventoryItem) return sum;
-          return sum + (item.price - inventoryItem.costPrice) * item.quantity;
-        }, 0),
-      };
-      
-      const updatedInventory: InventoryItem[] = [];
-      for (const cartItem of cart) {
-        const item = db.inventory.find((i) => i.id === cartItem.itemId);
-        if (!item) return { error: `Item ${cartItem.itemId} not found` };
-        if (item.stockLevel < cartItem.quantity) return { error: `Insufficient stock for ${item.name}` };
-        item.stockLevel -= cartItem.quantity;
-        item.lastSoldDate = new Date().toISOString();
-        updatedInventory.push({ ...item });
+      if (error) {
+        // Fallback: If RPC fails or doesn't exist, we might want to do it manually (omitted for brevity)
+        return { error: error.message };
       }
-      
-      db.sales.push(sale);
-      db.nextSaleNumber += 1;
-      await persistDb(db);
+
+      // Supabase RPC usually returns the inserted sale record. 
+      // We need to fetch the updated inventory to keep frontend in sync.
+      const sale = mapSaleRow(data as DbSaleRow);
+      const updatedInventory = await getInventory(); 
       
       return { sale, updatedInventory };
     }
-    const { data, error } = await supabase.rpc('process_sale', { cart });
-    if (error) return { error: error.message };
-    const sale = mapSaleRow(data as DbSaleRow);
-    const updatedInventory = await getInventory();
-    return { sale, updatedInventory };
   }
 
+  // Local Fallback
   await ensureDbLoaded();
   const db = getDb();
 
+  // Validate Stock
   for (const line of cart) {
     const item = db.inventory.find((i) => i.id === line.itemId);
     if (!item) return { error: `Item not found: ${line.itemId}` };
-    if (line.quantity <= 0) return { error: 'Quantity must be positive' };
     if (item.stockLevel < line.quantity) return { error: `Not enough stock for ${item.name}` };
   }
 
+  const now = new Date().toISOString();
   let total = 0;
   let profit = 0;
-  const now = new Date().toISOString();
-
-  const receiptNumber = db.nextSaleNumber;
-  db.nextSaleNumber += 1;
+  const receiptNumber = db.nextSaleNumber++;
 
   const updatedInventory = db.inventory.map((item) => {
     const line = cart.find((c) => c.itemId === item.id);
     if (!line) return item;
+    
     total += line.price * line.quantity;
     profit += (line.price - item.costPrice) * line.quantity;
+    
     return {
       ...item,
       stockLevel: item.stockLevel - line.quantity,
@@ -443,18 +373,12 @@ export async function processSale(
 export async function clearSalesData(): Promise<void> {
   if (hasSupabase) {
     const supabase = getSupabaseAdmin();
-    if (!supabase) {
-      await ensureDbLoaded();
-      const db = getDb();
-      db.sales = [];
-      await persistDb(db);
+    if (supabase) {
+      const { error } = await supabase.from('sales').delete().gt('receipt_number', -1);
+      if (error) throw error;
       return;
     }
-    const { error } = await supabase.from('sales').delete().gt('receipt_number', -1);
-    if (error) throw error;
-    return;
   }
-
   await ensureDbLoaded();
   const db = getDb();
   db.sales = [];

@@ -19,17 +19,19 @@ export default function InventoryTable({ items }: { items: InventoryItem[] }) {
   const [isPending, startTransition] = useTransition();
 
   const onDelete = (id: string) => {
-    const ok = confirm('Are you sure you want to delete this product?');
+    // 1. Confirmation
+    const ok = confirm('Are you sure you want to delete this product? This will also remove it from sales history.');
     if (!ok) return;
 
+    // 2. Server Action with Auto-Refresh
     startTransition(async () => {
       const res = await deleteInventoryItemAction(id);
+      
       if (!res.success) {
         alert(res.message);
-        return;
-      }
-      // Hard reload to remove the item everywhere, works well on mobile
-      window.location.href = window.location.href;
+      } 
+      // No need for window.location.href! 
+      // revalidatePath in actions.ts will automatically trigger a UI update.
     });
   };
 
@@ -57,7 +59,7 @@ export default function InventoryTable({ items }: { items: InventoryItem[] }) {
               {items.map((item) => {
                 const status = getStatus(item);
                 return (
-                  <TableRow key={item.id}>
+                  <TableRow key={item.id} className={isPending ? 'opacity-50' : ''}>
                     <TableCell className="font-medium">{item.name}</TableCell>
                     <TableCell className="hidden text-muted-foreground sm:table-cell">{item.category}</TableCell>
                     <TableCell>₹{item.price}</TableCell>
@@ -88,7 +90,7 @@ export default function InventoryTable({ items }: { items: InventoryItem[] }) {
                         onClick={() => onDelete(item.id)}
                         disabled={isPending}
                       >
-                        Delete
+                        {isPending ? 'Deleting...' : 'Delete'}
                       </Button>
                     </TableCell>
                   </TableRow>

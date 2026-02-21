@@ -23,19 +23,26 @@ export default function PosClient({ inventory }: { inventory: InventoryItem[] })
   const [cart, setCart] = useState<CartLine[]>([]);
   const cartRef = useRef<HTMLDivElement | null>(null);
 
-  // Clean cart of deleted items on component mount
+  // 1. Auto-cleanup: If an item is deleted from DB, remove it from Cart automatically
+  // This runs whenever 'inventory' updates (which happens after router.refresh)
   useEffect(() => {
-    setCart(prev => prev.filter(cartItem => 
-      inventory.some(invItem => invItem.id === cartItem.itemId)
-    ));
+    setCart((prev) => 
+      prev.filter((cartItem) => 
+        inventory.some((invItem) => invItem.id === cartItem.itemId)
+      )
+    );
   }, [inventory]);
 
+  // 2. Calculate current quantities in cart
   const cartQtyById = useMemo(() => {
     const m = new Map<string, number>();
-    for (const line of cart) m.set(line.itemId, (m.get(line.itemId) ?? 0) + line.quantity);
+    for (const line of cart) {
+      m.set(line.itemId, (m.get(line.itemId) ?? 0) + line.quantity);
+    }
     return m;
   }, [cart]);
 
+  // 3. Derived state for products (calculating availability)
   const products = useMemo(() => {
     return inventory.map((p) => {
       const inCart = cartQtyById.get(p.id) ?? 0;
@@ -46,18 +53,22 @@ export default function PosClient({ inventory }: { inventory: InventoryItem[] })
     });
   }, [inventory, cartQtyById]);
 
+  // 4. Helper Functions
   const addToCart = (p: { id: string; name: string; category: string; price: number; stockLevel: number; available: number }) => {
     if (p.available <= 0) {
-      alert('This product is out of stock or has been deleted');
+      // Optional: You could use a Toast notification here instead of alert
+      alert('This product is out of stock');
       return;
     }
 
     setCart((prev) => {
       const idx = prev.findIndex((x) => x.itemId === p.id);
       if (idx === -1) {
-        return [...prev, { itemId: p.id, name: p.name, category: p.category, price: p.price, stockLevel: p.stockLevel, quantity: 1 }];
+        return [
+          ...prev, 
+          { itemId: p.id, name: p.name, category: p.category, price: p.price, stockLevel: p.stockLevel, quantity: 1 }
+        ];
       }
-
       const next = [...prev];
       next[idx] = { ...next[idx], quantity: next[idx].quantity + 1 };
       return next;
@@ -88,15 +99,24 @@ export default function PosClient({ inventory }: { inventory: InventoryItem[] })
     });
   };
 
+  const removeItem = (itemId: string) => {
+    setCart((prev) => prev.filter((x) => x.itemId !== itemId));
+  };
+
   const total = useMemo(() => cart.reduce((sum, l) => sum + l.price * l.quantity, 0), [cart]);
 
+  // 5. The Critical Fix: Soft Refresh
   const completeSale = () => {
     if (cart.length === 0) return;
 
     startTransition(async () => {
-      const res = await processSaleAction(
-        cart.map((l) => ({ itemId: l.itemId, quantity: l.quantity, price: l.price })),
-      );
+      const saleData = cart.map((l) => ({ 
+        itemId: l.itemId, 
+        quantity: l.quantity, 
+        price: l.price 
+      }));
+
+      const res = await processSaleAction(saleData);
 
       if (!res.success) {
         alert(res.message);
@@ -104,15 +124,14 @@ export default function PosClient({ inventory }: { inventory: InventoryItem[] })
       }
 
       alert('Sale completed successfully!');
-      setCart([]);
-      router.refresh();
-      // Force hard refresh with cache bypass for mobile
-      window.location.href = window.location.href;
+      setCart([]); // Clear UI immediately
+      router.refresh(); // Fetch new stock levels from server without page reload
     });
   };
 
   return (
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+      {/* Product Grid */}
       <div className="lg:col-span-2">
         <Card>
           <CardHeader>
@@ -125,8 +144,8 @@ export default function PosClient({ inventory }: { inventory: InventoryItem[] })
                   key={p.id}
                   type="button"
                   className={
-                    `rounded-lg border border-border p-3 text-left transition-colors active:scale-[0.98] ` +
-                    (p.available <= 0 ? 'opacity-50 bg-muted/50' : 'hover:bg-accent/40')
+                    `rounded-lg border border-border p-3 text-left transition-all active:scale-[0.98] ` +
+                    (p.available <= 0 ? 'opacity-50 bg-muted/50 cursor-not-allowed' : 'hover:bg-accent/40 hover:border-primary/50')
                   }
                   onClick={() => addToCart(p)}
                   disabled={p.available <= 0 || isPending}
@@ -134,7 +153,9 @@ export default function PosClient({ inventory }: { inventory: InventoryItem[] })
                   <div className="mb-1 text-sm font-medium line-clamp-2">{p.name}</div>
                   <div className="text-xs text-muted-foreground">{p.category}</div>
                   <div className="mt-2 text-base font-semibold">₹{p.price}</div>
-                  <div className="mt-1 text-xs text-muted-foreground">Stock: {p.stockLevel}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    {p.available === 0 ? 'No Stock' : `Stock: ${p.stockLevel}`}
+                  </div>
                   {p.available <= 0 && <div className="mt-2 text-xs font-semibold text-destructive">Out of Stock</div>}
                 </button>
               ))}
@@ -143,6 +164,7 @@ export default function PosClient({ inventory }: { inventory: InventoryItem[] })
         </Card>
       </div>
 
+      {/* Cart Sidebar */}
       <div className="lg:col-span-1" ref={cartRef}>
         <Card>
           <CardHeader>
@@ -165,7 +187,7 @@ export default function PosClient({ inventory }: { inventory: InventoryItem[] })
                       <Button variant="outline" size="icon" onClick={() => dec(line.itemId)} disabled={isPending}>
                         −
                       </Button>
-                      <span className="w-8 text-center">{line.quantity}</span>
+                      <span className="w-8 text-center text-sm">{line.quantity}</span>
                       <Button
                         variant="outline"
                         size="icon"
@@ -175,9 +197,10 @@ export default function PosClient({ inventory }: { inventory: InventoryItem[] })
                         +
                       </Button>
                       <Button
-                        variant="outline"
+                        variant="ghost"
                         size="icon"
-                        onClick={() => setCart((prev) => prev.filter((x) => x.itemId !== line.itemId))}
+                        className="text-muted-foreground hover:text-destructive"
+                        onClick={() => removeItem(line.itemId)}
                         disabled={isPending}
                       >
                         ×
@@ -192,7 +215,7 @@ export default function PosClient({ inventory }: { inventory: InventoryItem[] })
                     <span className="text-lg font-bold">₹{total.toLocaleString()}</span>
                   </div>
                   <Button className="w-full" onClick={completeSale} disabled={isPending}>
-                    Complete Sale
+                    {isPending ? 'Processing...' : 'Complete Sale'}
                   </Button>
                 </div>
               </div>
@@ -201,8 +224,9 @@ export default function PosClient({ inventory }: { inventory: InventoryItem[] })
         </Card>
       </div>
 
+      {/* Mobile Sticky Bottom Bar */}
       {cart.length > 0 && (
-        <div className="fixed inset-x-0 bottom-0 z-40 border-t border-border bg-background/90 backdrop-blur lg:hidden">
+        <div className="fixed inset-x-0 bottom-0 z-40 border-t border-border bg-background/90 backdrop-blur lg:hidden pb-safe">
           <div className="mx-auto flex w-full max-w-7xl items-center justify-between gap-3 px-4 py-3">
             <button
               type="button"
@@ -213,7 +237,7 @@ export default function PosClient({ inventory }: { inventory: InventoryItem[] })
               <div className="truncate text-base font-semibold">₹{total.toLocaleString()}</div>
             </button>
             <Button onClick={completeSale} disabled={isPending}>
-              Complete Sale
+              {isPending ? 'Processing...' : 'Complete Sale'}
             </Button>
           </div>
         </div>
